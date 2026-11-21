@@ -1,0 +1,41 @@
+name: WorkDesk hbbs (WebSocket registration)
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@1.81
+      - uses: Swatinem/rust-cache@v2
+      - name: Build hbbs/hbbr
+        run: cargo build --release --bin hbbs --bin hbbr
+      - name: Version
+        run: ./target/release/hbbs --version
+      - name: Unit tests
+        run: cargo test --release --bin hbbs || true
+      - name: Prepare test client
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
+          pip install -q "websockets<12" "protobuf<5"
+          protoc -I libs/hbb_common/protos --python_out=.github/workdesk-test libs/hbb_common/protos/rendezvous.proto
+      - name: WebSocket registration test
+        run: |
+          mkdir -p /tmp/hbbs && cd /tmp/hbbs
+          $GITHUB_WORKSPACE/target/release/hbbs -r relay.test:21117 > hbbs.log 2>&1 &
+          sleep 3
+          python3 $GITHUB_WORKSPACE/.github/workdesk-test/ws_register_test.py
+      - name: hbbs log
+        if: always()
+        run: cat /tmp/hbbs/hbbs.log || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: workdesk-hbbs-linux-x86_64
+          path: |
+            target/release/hbbs
+            target/release/hbbr
