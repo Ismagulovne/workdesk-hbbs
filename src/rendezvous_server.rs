@@ -1209,16 +1209,16 @@ impl RendezvousServer {
         let mut last_recv = Instant::now();
         loop {
             tokio::select! {
-                res = timeout(30_000, incoming.next()), if registered.is_none() => {
+                // a registered stream has no read deadline: its heartbeat closes it when idle
+                res = timeout(if registered.is_none() { 30_000 } else { 86_400_000 }, incoming.next()) => {
                     let Ok(Some(Some(bytes))) = res else { break };
                     last_recv = Instant::now();
-                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws, &stream_tx, &mut registered).await {
-                        break;
+                    if registered.is_none() {
+                        if !self.handle_tcp(&bytes, &mut sink, addr, key, ws, &stream_tx, &mut registered).await {
+                            break;
+                        }
+                        continue;
                     }
-                }
-                res = incoming.next(), if registered.is_some() => {
-                    let Some(Some(bytes)) = res else { break };
-                    last_recv = Instant::now();
                     if let Some(id) = registered.as_ref() {
                         if let Some(peer) = self.pm.get_in_memory(id).await {
                             let mut peer = peer.write().await;
