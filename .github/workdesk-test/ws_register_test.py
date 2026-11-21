@@ -32,6 +32,31 @@ async def recv_msg(ws, timeout=5, skip_empty=True):
         return m, data
 
 
+async def udp_check():
+    """Обычный клиент по UDP: регистрация и доставка запроса работают как раньше."""
+    import socket
+    loop = asyncio.get_running_loop()
+    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.setblocking(False); u.bind(("127.0.0.1", 0))
+    srv = ("127.0.0.1", 21116)
+
+    async def udp_recv(timeout=5):
+        data = await asyncio.wait_for(loop.sock_recv(u, 65535), timeout)
+        m = pb.RendezvousMessage(); m.ParseFromString(data); return m
+
+    u.sendto(msg(register_peer=pb.RegisterPeer(id="123123123", serial=0)), srv)
+    m = await udp_recv(); assert m.WhichOneof("union") == "register_peer_response", m
+    u.sendto(msg(register_pk=pb.RegisterPk(id="123123123", uuid=b"uuid-u", pk=b"U" * 32)), srv)
+    m = await udp_recv(); assert m.WhichOneof("union") == "register_pk_response" and m.register_pk_response.result == pb.RegisterPkResponse.OK, m
+    u.sendto(msg(register_peer=pb.RegisterPeer(id="123123123", serial=0)), srv)
+    m = await udp_recv(); assert m.WhichOneof("union") == "register_peer_response", m
+    print("OK  UDP: регистрация как раньше")
+    async with websockets.connect(WS, extra_headers={"X-Real-IP": "10.0.0.7"}) as a:
+        await a.send(msg(punch_hole_request=pb.PunchHoleRequest(id="123123123", licence_key=KEY)))
+        m = await udp_recv(); assert m.WhichOneof("union") in ("punch_hole", "fetch_local_addr"), m
+    print("OK  UDP: запрос на подключение доставлен по UDP")
+    u.close()
+
+
 async def main():
     hb = {"seen": False}
     async with websockets.connect(WS, extra_headers={"X-Real-IP": "10.0.0.2"}) as b:
@@ -91,6 +116,7 @@ async def main():
         assert m.WhichOneof("union") == "punch_hole_response", m
         assert m.punch_hole_response.failure == pb.PunchHoleResponse.OFFLINE, m
         print("OK  после закрытия потока B сразу «не в сети» (OFFLINE)")
+    await udp_check()
     print("ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ")
 
 
