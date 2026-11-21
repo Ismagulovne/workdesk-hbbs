@@ -62,12 +62,22 @@ async def main():
             assert m.punch_hole_response.failure == pb.PunchHoleResponse.ID_NOT_EXIST, m
             print("OK  неизвестный ID по-прежнему ID_NOT_EXIST")
 
-        data = await asyncio.wait_for(b.recv(), 30)
+        data = await asyncio.wait_for(b.recv(), 20)
         assert data == b"", f"ожидался heartbeat, пришло {data!r}"
         await b.send(b"")
         print("OK  heartbeat получен и подтвержден")
 
-        await asyncio.sleep(35)  # дольше 30 с таймаута чтения: поток зарегистрированного клиента живет
+        # 35 с, как настоящий клиент: отвечаем на каждый heartbeat (дольше 30 с REG_TIMEOUT)
+        loop = asyncio.get_running_loop(); end = loop.time() + 35; beats = 0
+        while loop.time() < end:
+            try:
+                data = await asyncio.wait_for(b.recv(), max(0.1, end - loop.time()))
+            except asyncio.TimeoutError:
+                break
+            assert data == b"", f"неожиданное сообщение {data!r}"
+            await b.send(b""); beats += 1
+        assert beats >= 2, f"за 35 с пришло {beats} heartbeat"
+        print(f"OK  за 35 с {beats} heartbeat, клиент отвечает")
         async with websockets.connect(WS, extra_headers={"X-Real-IP": "10.0.0.5"}) as d:
             await d.send(msg(punch_hole_request=pb.PunchHoleRequest(id=PEER_ID, licence_key=KEY)))
             m, _ = await recv_msg(b, timeout=10)

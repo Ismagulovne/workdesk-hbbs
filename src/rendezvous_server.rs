@@ -73,8 +73,8 @@ struct Inner {
 
 // WorkDesk: peers registered over a TCP/WebSocket stream (networks where UDP 21116 is closed).
 // Messages hbbs would send them by UDP go into their stream instead.
-const TCP_PEER_HEARTBEAT_MS: u64 = 20_000;
-const TCP_PEER_IDLE_MS: u128 = 70_000;
+const TCP_PEER_HEARTBEAT_MS: u64 = 12_000;
+const TCP_PEER_IDLE_MS: u128 = 40_000;
 type TcpPeers = Arc<Mutex<HashMap<SocketAddr, mpsc::UnboundedSender<Bytes>>>>;
 
 #[derive(Clone)]
