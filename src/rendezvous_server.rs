@@ -1260,6 +1260,13 @@ impl RendezvousServer {
         }
         if let Some(id) = registered {
             self.tcp_peers.lock().await.remove(&addr);
+            // the peer is reachable only through this stream: report it offline right away
+            if let Some(peer) = self.pm.get_in_memory(&id).await {
+                let mut peer = peer.write().await;
+                if peer.socket_addr == addr {
+                    peer.last_reg_time = get_expired_time();
+                }
+            }
             log::info!("Peer {} stream from {} closed", id, addr);
         }
         if sink.is_none() {

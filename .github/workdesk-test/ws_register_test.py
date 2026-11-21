@@ -87,12 +87,10 @@ async def main():
     await asyncio.sleep(1)
     async with websockets.connect(WS, extra_headers={"X-Real-IP": "10.0.0.6"}) as e:
         await e.send(msg(punch_hole_request=pb.PunchHoleRequest(id=PEER_ID, licence_key=KEY)))
-        try:
-            m, _ = await recv_msg(e, timeout=5)
-            print("INFO после закрытия потока B:", m.WhichOneof("union"),
-                  getattr(m, m.WhichOneof("union")).failure if m.WhichOneof("union") == "punch_hole_response" else "")
-        except asyncio.TimeoutError:
-            print("INFO после закрытия потока B ответа нет (запрос ушел по UDP на старый адрес)")
+        m, _ = await recv_msg(e, timeout=5)
+        assert m.WhichOneof("union") == "punch_hole_response", m
+        assert m.punch_hole_response.failure == pb.PunchHoleResponse.OFFLINE, m
+        print("OK  после закрытия потока B сразу «не в сети» (OFFLINE)")
     print("ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ")
 
 
