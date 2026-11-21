@@ -10,6 +10,7 @@ import rendezvous_pb2 as pb
 
 WS = "ws://127.0.0.1:21118"
 PEER_ID = "987654321"
+KEY = open(os.environ.get("HBBS_KEY_FILE", "id_ed25519.pub")).read().strip()
 
 
 def msg(**kw):
@@ -41,7 +42,7 @@ async def main():
         print("OK  регистрация через WebSocket")
 
         async with websockets.connect(WS, extra_headers={"X-Real-IP": "10.0.0.3"}) as a:
-            await a.send(msg(punch_hole_request=pb.PunchHoleRequest(id=PEER_ID)))
+            await a.send(msg(punch_hole_request=pb.PunchHoleRequest(id=PEER_ID, licence_key=KEY)))
             m, _ = await recv_msg(b)
             kind = m.WhichOneof("union")
             assert kind in ("punch_hole", "fetch_local_addr"), m
@@ -55,7 +56,7 @@ async def main():
             print("OK  ответ B доставлен A (RelayResponse)")
 
         async with websockets.connect(WS, extra_headers={"X-Real-IP": "10.0.0.4"}) as c:
-            await c.send(msg(punch_hole_request=pb.PunchHoleRequest(id="111222333")))
+            await c.send(msg(punch_hole_request=pb.PunchHoleRequest(id="111222333", licence_key=KEY)))
             m, _ = await recv_msg(c)
             assert m.WhichOneof("union") == "punch_hole_response", m
             assert m.punch_hole_response.failure == pb.PunchHoleResponse.ID_NOT_EXIST, m
@@ -68,14 +69,14 @@ async def main():
 
         await asyncio.sleep(35)  # дольше 30 с таймаута чтения: поток зарегистрированного клиента живет
         async with websockets.connect(WS, extra_headers={"X-Real-IP": "10.0.0.5"}) as d:
-            await d.send(msg(punch_hole_request=pb.PunchHoleRequest(id=PEER_ID)))
+            await d.send(msg(punch_hole_request=pb.PunchHoleRequest(id=PEER_ID, licence_key=KEY)))
             m, _ = await recv_msg(b, timeout=10)
             assert m.WhichOneof("union") in ("punch_hole", "fetch_local_addr"), m
             print("OK  через 35 с клиент онлайн, запросы доходят")
 
     await asyncio.sleep(1)
     async with websockets.connect(WS, extra_headers={"X-Real-IP": "10.0.0.6"}) as e:
-        await e.send(msg(punch_hole_request=pb.PunchHoleRequest(id=PEER_ID)))
+        await e.send(msg(punch_hole_request=pb.PunchHoleRequest(id=PEER_ID, licence_key=KEY)))
         try:
             m, _ = await recv_msg(e, timeout=5)
             print("INFO после закрытия потока B:", m.WhichOneof("union"),
