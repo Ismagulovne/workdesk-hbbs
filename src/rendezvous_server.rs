@@ -76,11 +76,15 @@ struct Inner {
 const TCP_PEER_HEARTBEAT_MS: u64 = 12_000;
 const TCP_PEER_IDLE_MS: u128 = 40_000;
 type TcpPeers = Arc<Mutex<HashMap<SocketAddr, mpsc::UnboundedSender<Bytes>>>>;
+// The stream a peer registered last, by ID: a peer may keep UDP and a WebSocket stream at once,
+// requests for it then go both ways and the client drops the duplicate.
+type PeerStreams = Arc<Mutex<HashMap<String, (SocketAddr, mpsc::UnboundedSender<Bytes>)>>>;
 
 #[derive(Clone)]
 pub struct RendezvousServer {
     tcp_punch: Arc<Mutex<HashMap<SocketAddr, Sink>>>,
     tcp_peers: TcpPeers,
+    peer_streams: PeerStreams,
     pm: PeerMap,
     tx: Sender,
     relay_servers: Arc<RelayServers>,
@@ -129,6 +133,7 @@ impl RendezvousServer {
         let mut rs = Self {
             tcp_punch: Arc::new(Mutex::new(HashMap::new())),
             tcp_peers: Arc::new(Mutex::new(HashMap::new())),
+            peer_streams: Arc::new(Mutex::new(HashMap::new())),
             pm,
             tx: tx.clone(),
             relay_servers: Default::default(),
@@ -431,7 +436,7 @@ impl RendezvousServer {
                     (true, false)
                 } else {
                     if peer.uuid == rk.uuid {
-                        if peer.info.ip != ip && peer.pk != rk.pk {
+                        if !same_ip(&peer.info.ip, &ip) && peer.pk != rk.pk {
                             log::warn!(
                                 "Peer {} ip/pk mismatch: {}/{:?} vs {}/{:?}",
                                 id,
@@ -453,7 +458,7 @@ impl RendezvousServer {
                         drop(peer);
                         return Some(UUID_MISMATCH);
                     }
-                    let ip_changed = peer.info.ip != ip;
+                    let ip_changed = !same_ip(&peer.info.ip, &ip);
                     (
                         peer.uuid != rk.uuid || peer.pk != rk.pk || ip_changed,
                         ip_changed,
@@ -520,11 +525,13 @@ impl RendezvousServer {
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                     }
+                    let id_for_copy = rf.id.clone();
                     if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
                         let mut msg_out = RendezvousMessage::new();
                         rf.socket_addr = AddrMangle::encode(addr).into();
                         msg_out.set_request_relay(rf);
                         let peer_addr = peer.read().await.socket_addr;
+                        self.copy_to_peer_stream(&id_for_copy, peer_addr, &msg_out).await;
                         self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
                     }
                     return true;
@@ -578,10 +585,17 @@ impl RendezvousServer {
                     if res == register_pk_response::Result::OK {
                         if let Some(peer) = self.pm.get_in_memory(&id).await {
                             let mut peer = peer.write().await;
-                            peer.socket_addr = addr;
+                            // a peer that is alive over UDP keeps its UDP address; the stream is the second channel
+                            let udp_alive = peer.socket_addr != addr
+                                && !self.tcp_peers.lock().await.contains_key(&peer.socket_addr)
+                                && (peer.last_reg_time.elapsed().as_millis() as i32) < REG_TIMEOUT;
+                            if !udp_alive {
+                                peer.socket_addr = addr;
+                            }
                             peer.last_reg_time = Instant::now();
                         }
                         self.tcp_peers.lock().await.insert(addr, stream_tx.clone());
+                        self.peer_streams.lock().await.insert(id.clone(), (addr, stream_tx.clone()));
                         if registered.as_deref() != Some(id.as_str()) {
                             log::info!("Peer {} registered over {} from {}", id, if ws { "websocket" } else { "tcp" }, addr);
                         }
@@ -612,9 +626,9 @@ impl RendezvousServer {
             let mut old = old.write().await;
             let ip = socket_addr.ip();
             let ip_change = if old.socket_addr.port() != 0 {
-                ip != old.socket_addr.ip()
+                try_into_v4(SocketAddr::new(ip, 0)).ip() != try_into_v4(old.socket_addr).ip()
             } else {
-                ip.to_string() != old.info.ip
+                !same_ip(&ip.to_string(), &old.info.ip)
             } && !ip.is_loopback();
             let request_pk = old.pk.is_empty() || ip_change;
             if !request_pk {
@@ -876,13 +890,28 @@ impl RendezvousServer {
         key: &str,
         ws: bool,
     ) -> ResultType<()> {
+        let id = ph.id.clone();
         let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, ws).await?;
         if let Some(addr) = to_addr {
+            self.copy_to_peer_stream(&id, addr, &msg).await;
             self.tx.send(Data::Msg(msg.into(), addr))?;
         } else {
             self.send_to_tcp_sync(msg, addr).await?;
         }
         Ok(())
+    }
+
+    /// Second channel: a copy of a request for peer `id` into its WebSocket/TCP stream, unless
+    /// `peer_addr` (where the request goes anyway) is that stream.
+    async fn copy_to_peer_stream(&self, id: &str, peer_addr: SocketAddr, msg: &RendezvousMessage) {
+        let entry = self.peer_streams.lock().await.get(id).cloned();
+        if let Some((stream_addr, stream_tx)) = entry {
+            if stream_addr != peer_addr {
+                if let Ok(bytes) = msg.write_to_bytes() {
+                    stream_tx.send(Bytes::from(bytes)).ok();
+                }
+            }
+        }
     }
 
     #[inline]
@@ -892,7 +921,11 @@ impl RendezvousServer {
         ph: PunchHoleRequest,
         key: &str,
     ) -> ResultType<()> {
+        let id = ph.id.clone();
         let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, false).await?;
+        if let Some(peer_addr) = to_addr {
+            self.copy_to_peer_stream(&id, peer_addr, &msg).await;
+        }
         self.tx.send(Data::Msg(
             msg.into(),
             match to_addr {
@@ -1221,10 +1254,8 @@ impl RendezvousServer {
                     }
                     if let Some(id) = registered.as_ref() {
                         if let Some(peer) = self.pm.get_in_memory(id).await {
-                            let mut peer = peer.write().await;
-                            if peer.socket_addr == addr {
-                                peer.last_reg_time = Instant::now();
-                            }
+                            // any message on the stream proves the peer is online
+                            peer.write().await.last_reg_time = Instant::now();
                         }
                     }
                     if bytes.is_empty() {
@@ -1260,6 +1291,12 @@ impl RendezvousServer {
         }
         if let Some(id) = registered {
             self.tcp_peers.lock().await.remove(&addr);
+            {
+                let mut streams = self.peer_streams.lock().await;
+                if streams.get(&id).map(|(a, _)| *a == addr).unwrap_or(false) {
+                    streams.remove(&id);
+                }
+            }
             // the peer is reachable only through this stream: report it offline right away
             if let Some(peer) = self.pm.get_in_memory(&id).await {
                 let mut peer = peer.write().await;
@@ -1424,6 +1461,12 @@ async fn test_hbbs(addr: SocketAddr) -> ResultType<()> {
 }
 
 #[inline]
+/// The same address seen over UDP (IPv4-mapped IPv6, "::ffff:1.2.3.4") and over a proxied
+/// WebSocket ("1.2.3.4") is the same IP.
+fn same_ip(a: &str, b: &str) -> bool {
+    a.trim_start_matches("::ffff:") == b.trim_start_matches("::ffff:")
+}
+
 async fn send_rk_res(
     socket: &mut FramedSocket,
     addr: SocketAddr,

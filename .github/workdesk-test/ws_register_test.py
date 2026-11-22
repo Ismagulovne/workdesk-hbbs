@@ -57,6 +57,51 @@ async def udp_check():
     u.close()
 
 
+async def dual_check():
+    """Два канала сразу: UDP и WebSocket у одного клиента, запрос приходит по обоим; UDP замолчал — клиент в сети через WebSocket."""
+    import socket
+    loop = asyncio.get_running_loop()
+    PID = "777888999"
+    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.setblocking(False); u.bind(("127.0.0.1", 0))
+    srv = ("127.0.0.1", 21116)
+
+    async def udp_recv(timeout=5):
+        while True:
+            data = await asyncio.wait_for(loop.sock_recv(u, 65535), timeout)
+            m = pb.RendezvousMessage(); m.ParseFromString(data)
+            if m.WhichOneof("union") != "register_peer_response":
+                return m
+
+    u.sendto(msg(register_peer=pb.RegisterPeer(id=PID, serial=0)), srv)
+    u.sendto(msg(register_pk=pb.RegisterPk(id=PID, uuid=b"uuid-d", pk=b"D" * 32)), srv)
+    m = await udp_recv(); assert m.WhichOneof("union") == "register_pk_response" and m.register_pk_response.result == pb.RegisterPkResponse.OK, m
+    u.sendto(msg(register_peer=pb.RegisterPeer(id=PID, serial=0)), srv)
+    async with websockets.connect(WS, extra_headers={"X-Real-IP": "127.0.0.1"}) as b:
+        await b.send(msg(register_pk=pb.RegisterPk(id=PID, uuid=b"uuid-d", pk=b"D" * 32)))
+        m, _ = await recv_msg(b); assert m.register_pk_response.result == pb.RegisterPkResponse.OK, m
+        print("OK  два канала: зарегистрирован и по UDP, и через WebSocket")
+        async with websockets.connect(WS, extra_headers={"X-Real-IP": "10.0.0.9"}) as a:
+            await a.send(msg(punch_hole_request=pb.PunchHoleRequest(id=PID, licence_key=KEY)))
+            mu = await udp_recv(); assert mu.WhichOneof("union") in ("punch_hole", "fetch_local_addr"), mu
+            mw, _ = await recv_msg(b); assert mw.WhichOneof("union") == mu.WhichOneof("union"), mw
+            print("OK  два канала: запрос пришёл и по UDP, и в поток WebSocket")
+        # UDP замолчал (клиент больше не шлёт RegisterPeer); поток отвечает на heartbeat 35 с
+        end = loop.time() + 35
+        while loop.time() < end:
+            try:
+                data = await asyncio.wait_for(b.recv(), max(0.1, end - loop.time()))
+            except asyncio.TimeoutError:
+                break
+            if data == b"":
+                await b.send(b"")
+        async with websockets.connect(WS, extra_headers={"X-Real-IP": "10.0.0.10"}) as a:
+            await a.send(msg(punch_hole_request=pb.PunchHoleRequest(id=PID, licence_key=KEY)))
+            mw, _ = await recv_msg(b, timeout=10)
+            assert mw.WhichOneof("union") in ("punch_hole", "fetch_local_addr"), mw
+            print("OK  два канала: UDP молчит 35 с, клиент в сети, запрос дошёл через WebSocket")
+    u.close()
+
+
 async def main():
     hb = {"seen": False}
     async with websockets.connect(WS, extra_headers={"X-Real-IP": "10.0.0.2"}) as b:
@@ -117,6 +162,7 @@ async def main():
         assert m.punch_hole_response.failure == pb.PunchHoleResponse.OFFLINE, m
         print("OK  после закрытия потока B сразу «не в сети» (OFFLINE)")
     await udp_check()
+    await dual_check()
     print("ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ")
 
 
