@@ -879,7 +879,9 @@ impl RendezvousServer {
             if let Ok(bytes) = msg.write_to_bytes() {
                 match sink {
                     Sink::TcpStream(s, enc) => {
-                        allow_err!(s.send(seal(enc, Bytes::from(bytes))).await);
+                        let r = s.send(seal(enc, Bytes::from(bytes))).await;
+                        log::info!("Reply to tcp (encrypted: {}): {:?}", enc.is_some(), r.as_ref().map(|_| ()));
+                        allow_err!(r);
                     }
                     Sink::Ws(ws) => {
                         allow_err!(ws.send(tungstenite::Message::Binary(bytes)).await);
@@ -896,6 +898,7 @@ impl RendezvousServer {
         addr: SocketAddr,
     ) -> ResultType<()> {
         let mut sink = self.tcp_punch.lock().await.remove(&try_into_v4(addr));
+        log::info!("Reply to {:?}: sink found {}", addr, sink.is_some());
         Self::send_to_sink(&mut sink, msg).await;
         Ok(())
     }
