@@ -238,6 +238,9 @@ async def main():
         assert m.punch_hole_response.failure == pb.PunchHoleResponse.OFFLINE, m
         print("OK  после закрытия потока B сразу «не в сети» (OFFLINE)")
     await kx_check()
+    import stress_kx
+    stress_kx.KEY, stress_kx.frame, stress_kx.msg, stress_kx.read_frame = KEY, frame, msg, read_frame
+    await stress_kx.stress_check()
     await udp_check()
     await dual_check()
     print("ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ")
