@@ -1280,7 +1280,13 @@ impl RendezvousServer {
             let rest = b.map(move |r| {
                 r.ok().and_then(|mut bytes| match dec.as_ref() {
                     // a frame that does not open closes the connection
-                    Some(e) => e.lock().unwrap().dec(&mut bytes).ok().map(|_| bytes.freeze()),
+                    Some(e) => match e.lock().unwrap().dec(&mut bytes) {
+                        Ok(()) => Some(bytes.freeze()),
+                        Err(err) => {
+                            log::warn!("Tcp frame from {:?} does not open: {}", addr, err);
+                            None
+                        }
+                    },
                     None => Some(bytes.freeze()),
                 })
             });
@@ -1313,6 +1319,7 @@ impl RendezvousServer {
                 res = timeout(if registered.is_none() { 30_000 } else { 86_400_000 }, incoming.next()) => {
                     let Ok(Some(Some(bytes))) = res else { break };
                     last_recv = Instant::now();
+                    log::info!("Tcp frame from {:?}: {} bytes", addr, bytes.len());
                     if registered.is_none() {
                         if !self.handle_tcp(&bytes, &mut sink, addr, key, ws, &stream_tx, &mut registered).await {
                             break;
