@@ -879,9 +879,7 @@ impl RendezvousServer {
             if let Ok(bytes) = msg.write_to_bytes() {
                 match sink {
                     Sink::TcpStream(s, enc) => {
-                        let r = s.send(seal(enc, Bytes::from(bytes))).await;
-                        log::info!("Reply to tcp (encrypted: {}): {:?}", enc.is_some(), r.as_ref().map(|_| ()));
-                        allow_err!(r);
+                        allow_err!(s.send(seal(enc, Bytes::from(bytes))).await);
                     }
                     Sink::Ws(ws) => {
                         allow_err!(ws.send(tungstenite::Message::Binary(bytes)).await);
@@ -898,7 +896,6 @@ impl RendezvousServer {
         addr: SocketAddr,
     ) -> ResultType<()> {
         let mut sink = self.tcp_punch.lock().await.remove(&try_into_v4(addr));
-        log::info!("Reply to {:?}: sink found {}", addr, sink.is_some());
         Self::send_to_sink(&mut sink, msg).await;
         Ok(())
     }
@@ -1245,7 +1242,6 @@ impl RendezvousServer {
                 Ok(Some(Ok(bytes))) => first = Some(bytes.freeze()),
                 Ok(_) => return Ok(()), // closed before saying anything
                 Err(_) => {
-                    log::info!("Tcp connection from {:?} is silent, key exchange: {}", addr, self.inner.sk.is_some());
                     if let Some(sk) = self.inner.sk.as_ref() {
                         let (mut our_pk, our_sk) = box_::gen_keypair();
                         // The high bit of the signed key marks servers that also sign key exchange
@@ -1257,7 +1253,6 @@ impl RendezvousServer {
                             ..Default::default()
                         });
                         a.send(Bytes::from(msg_out.write_to_bytes()?)).await?;
-                        log::info!("KeyExchange sent to {:?}", addr);
                         match timeout(KX_REPLY_MS, b.next()).await {
                             Ok(Some(Ok(bytes))) => {
                                 let bytes = bytes.freeze();
@@ -1268,7 +1263,7 @@ impl RendezvousServer {
                                     }) if ex.keys.len() == 2 => {
                                         let key = Encrypt::decode(&ex.keys[1], &ex.keys[0], &our_sk)?;
                                         enc = Some(Arc::new(std::sync::Mutex::new(Encrypt::new(key))));
-                                        log::info!("Tcp connection from {:?} secured", addr);
+                                        log::debug!("Tcp connection from {:?} secured", addr);
                                     }
                                     // an old client that answered something else: serve it in the clear
                                     _ => first = Some(bytes),
@@ -1322,7 +1317,6 @@ impl RendezvousServer {
                 res = timeout(if registered.is_none() { 30_000 } else { 86_400_000 }, incoming.next()) => {
                     let Ok(Some(Some(bytes))) = res else { break };
                     last_recv = Instant::now();
-                    log::info!("Tcp frame from {:?}: {} bytes", addr, bytes.len());
                     if registered.is_none() {
                         if !self.handle_tcp(&bytes, &mut sink, addr, key, ws, &stream_tx, &mut registered).await {
                             break;

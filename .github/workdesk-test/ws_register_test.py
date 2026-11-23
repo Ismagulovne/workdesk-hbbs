@@ -162,10 +162,7 @@ async def kx_check():
     m = pb.RendezvousMessage(); m.ParseFromString(box.decrypt(data, nonce(1)))
     assert m.WhichOneof("union") == "punch_hole_response", m
     assert m.punch_hole_response.failure == pb.PunchHoleResponse.ID_NOT_EXIST, m
-    # второй запрос — со следующим номером, ответ тоже
-    w.write(frame(box.encrypt(req, nonce(2)).ciphertext)); await w.drain()
-    m = pb.RendezvousMessage(); m.ParseFromString(box.decrypt(await read_frame(r), nonce(2)))
-    assert m.WhichOneof("union") == "punch_hole_response", m
+    # соединение запроса одноразовое (как в обычном WorkDesk): после ответа сервер больше не пишет
     w.close()
     print("OK  TCP со входом: KeyExchange, запросы и ответы зашифрованы")
 
