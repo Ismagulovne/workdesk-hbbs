@@ -102,6 +102,85 @@ async def dual_check():
     u.close()
 
 
+def frame(data):
+    """Кадр hbb_common BytesCodec: длина << 2 в 1–4 байтах, младшие 2 бита — длина заголовка - 1."""
+    n = len(data)
+    if n <= 0x3F:
+        head = (n << 2).to_bytes(1, "little")
+    elif n <= 0x3FFF:
+        head = ((n << 2) | 1).to_bytes(2, "little")
+    elif n <= 0x3FFFFF:
+        head = ((n << 2) | 2).to_bytes(3, "little")
+    else:
+        head = ((n << 2) | 3).to_bytes(4, "little")
+    return head + data
+
+
+async def read_frame(reader, timeout=5):
+    b0 = (await asyncio.wait_for(reader.readexactly(1), timeout))[0]
+    hl = (b0 & 3) + 1
+    rest = await asyncio.wait_for(reader.readexactly(hl - 1), timeout) if hl > 1 else b""
+    n = int.from_bytes(bytes([b0]) + rest, "little") >> 2
+    return await asyncio.wait_for(reader.readexactly(n), timeout) if n else b""
+
+
+async def kx_check():
+    """Клиент, вошедший в консоль (secure_tcp): молчит, получает KeyExchange, дальше всё зашифровано.
+    Клиент без входа шлёт запрос сразу и обмена не видит."""
+    import base64
+    from nacl.signing import VerifyKey
+    from nacl.public import PrivateKey, PublicKey, Box
+    from nacl.secret import SecretBox
+    from nacl.utils import random as nrandom
+
+    # без входа: запрос сразу, ответ открытым текстом, KeyExchange не приходит
+    r, w = await asyncio.open_connection("127.0.0.1", 21116)
+    w.write(frame(msg(punch_hole_request=pb.PunchHoleRequest(id="111222333", licence_key=KEY)))); await w.drain()
+    m = pb.RendezvousMessage(); m.ParseFromString(await read_frame(r))
+    assert m.WhichOneof("union") == "punch_hole_response", m
+    assert m.punch_hole_response.failure == pb.PunchHoleResponse.ID_NOT_EXIST, m
+    w.close()
+    print("OK  TCP без входа: ответ сразу, без обмена ключами")
+
+    # со входом: молчим, сервер присылает подписанный ключ
+    r, w = await asyncio.open_connection("127.0.0.1", 21116)
+    m = pb.RendezvousMessage(); m.ParseFromString(await read_frame(r, timeout=5))
+    assert m.WhichOneof("union") == "key_exchange", m
+    assert len(m.key_exchange.keys) == 1, m
+    server_pk = VerifyKey(base64.b64decode(KEY)).verify(m.key_exchange.keys[0])
+    assert len(server_pk) == 32 and server_pk[31] & 0x80 == 0, "ключ сервера без старшего бита"
+    ours = PrivateKey.generate()
+    sym = nrandom(SecretBox.KEY_SIZE)
+    sealed = Box(ours, PublicKey(server_pk)).encrypt(sym, bytes(24)).ciphertext
+    ke = pb.RendezvousMessage(); ke.key_exchange.keys.extend([bytes(ours.public_key), sealed])
+    w.write(frame(ke.SerializeToString())); await w.drain()
+    box = SecretBox(sym)
+    nonce = lambda seq: seq.to_bytes(8, "little") + bytes(16)
+    req = msg(punch_hole_request=pb.PunchHoleRequest(id="111222333", licence_key=KEY))
+    w.write(frame(box.encrypt(req, nonce(1)).ciphertext)); await w.drain()
+    data = await read_frame(r)
+    m = pb.RendezvousMessage(); m.ParseFromString(box.decrypt(data, nonce(1)))
+    assert m.WhichOneof("union") == "punch_hole_response", m
+    assert m.punch_hole_response.failure == pb.PunchHoleResponse.ID_NOT_EXIST, m
+    # второй запрос — со следующим номером, ответ тоже
+    w.write(frame(box.encrypt(req, nonce(2)).ciphertext)); await w.drain()
+    m = pb.RendezvousMessage(); m.ParseFromString(box.decrypt(await read_frame(r), nonce(2)))
+    assert m.WhichOneof("union") == "punch_hole_response", m
+    w.close()
+    print("OK  TCP со входом: KeyExchange, запросы и ответы зашифрованы")
+
+    # мусор вместо ответа на обмен: сервер не падает и обслуживает дальше
+    r, w = await asyncio.open_connection("127.0.0.1", 21116)
+    await read_frame(r, timeout=5)
+    w.write(frame(b"garbage")); await w.drain(); w.close()
+    r, w = await asyncio.open_connection("127.0.0.1", 21116)
+    w.write(frame(msg(punch_hole_request=pb.PunchHoleRequest(id="111222333", licence_key=KEY)))); await w.drain()
+    m = pb.RendezvousMessage(); m.ParseFromString(await read_frame(r))
+    assert m.WhichOneof("union") == "punch_hole_response", m
+    w.close()
+    print("OK  мусор в обмене ключами не ломает сервер")
+
+
 async def main():
     hb = {"seen": False}
     async with websockets.connect(WS, extra_headers={"X-Real-IP": "10.0.0.2"}) as b:
@@ -161,6 +240,7 @@ async def main():
         assert m.WhichOneof("union") == "punch_hole_response", m
         assert m.punch_hole_response.failure == pb.PunchHoleResponse.OFFLINE, m
         print("OK  после закрытия потока B сразу «не в сети» (OFFLINE)")
+    await kx_check()
     await udp_check()
     await dual_check()
     print("ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ")

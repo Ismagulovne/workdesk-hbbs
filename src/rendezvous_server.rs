@@ -16,7 +16,7 @@ use hbb_common::{
         register_pk_response::Result::{TOO_FREQUENT, UUID_MISMATCH},
         *,
     },
-    tcp::{listen_any, FramedStream},
+    tcp::{listen_any, Encrypt, FramedStream},
     timeout,
     tokio::{
         self,
@@ -31,7 +31,7 @@ use hbb_common::{
     AddrMangle, ResultType,
 };
 use ipnetwork::Ipv4Network;
-use sodiumoxide::crypto::sign;
+use sodiumoxide::crypto::{box_, sign};
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -50,9 +50,27 @@ enum Data {
 const REG_TIMEOUT: i32 = 30_000;
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
+/// WorkDesk: after the key exchange on a TCP connection everything on it is sealed with this key.
+type SharedEncrypt = Arc<std::sync::Mutex<Encrypt>>;
 enum Sink {
-    TcpStream(TcpStreamSink),
+    TcpStream(TcpStreamSink, Option<SharedEncrypt>),
     Ws(WsSink),
+}
+
+/// WorkDesk: how long a new TCP connection may stay silent before hbbs offers the key exchange.
+/// A client signed in to the console (it has an access token) runs `secure_tcp` and waits for the
+/// server's KeyExchange; every other client sends its request at once and never sees one.
+const KX_PROBE_MS: u64 = 800;
+/// How long hbbs waits for the client's half of the key exchange.
+const KX_REPLY_MS: u64 = 10_000;
+
+/// Seals a frame for an encrypted connection. Empty frames (heartbeats) stay as they are:
+/// the client passes frames of one byte or less through without decrypting them.
+fn seal(enc: &Option<SharedEncrypt>, bytes: Bytes) -> Bytes {
+    match enc {
+        Some(e) if bytes.len() > 1 => Bytes::from(e.lock().unwrap().enc(&bytes)),
+        _ => bytes,
+    }
 }
 type Sender = mpsc::UnboundedSender<Data>;
 type Receiver = mpsc::UnboundedReceiver<Data>;
@@ -860,8 +878,8 @@ impl RendezvousServer {
         if let Some(sink) = sink.as_mut() {
             if let Ok(bytes) = msg.write_to_bytes() {
                 match sink {
-                    Sink::TcpStream(s) => {
-                        allow_err!(s.send(Bytes::from(bytes)).await);
+                    Sink::TcpStream(s, enc) => {
+                        allow_err!(s.send(seal(enc, Bytes::from(bytes))).await);
                     }
                     Sink::Ws(ws) => {
                         allow_err!(ws.send(tungstenite::Message::Binary(bytes)).await);
@@ -1216,9 +1234,56 @@ impl RendezvousServer {
             }));
             self.run_stream(incoming, Some(Sink::Ws(a)), addr, key, ws).await;
         } else {
-            let (a, b) = Framed::new(stream, BytesCodec::new()).split();
-            let incoming = Box::pin(b.map(|r| r.ok().map(|bytes| bytes.freeze())));
-            self.run_stream(incoming, Some(Sink::TcpStream(a)), addr, key, ws).await;
+            let (mut a, mut b) = Framed::new(stream, BytesCodec::new()).split();
+            // WorkDesk: a client that stays silent waits for the key exchange (see KX_PROBE_MS).
+            let mut first: Option<Bytes> = None;
+            let mut enc: Option<SharedEncrypt> = None;
+            match timeout(KX_PROBE_MS, b.next()).await {
+                Ok(Some(Ok(bytes))) => first = Some(bytes.freeze()),
+                Ok(_) => return Ok(()), // closed before saying anything
+                Err(_) => {
+                    if let Some(sk) = self.inner.sk.as_ref() {
+                        let (mut our_pk, our_sk) = box_::gen_keypair();
+                        // The high bit of the signed key marks servers that also sign key exchange
+                        // parameters; this one does not. X25519 ignores the bit.
+                        our_pk.0[31] &= 0x7f;
+                        let mut msg_out = RendezvousMessage::new();
+                        msg_out.set_key_exchange(KeyExchange {
+                            keys: vec![sign::sign(&our_pk.0, sk).into()],
+                            ..Default::default()
+                        });
+                        a.send(Bytes::from(msg_out.write_to_bytes()?)).await?;
+                        match timeout(KX_REPLY_MS, b.next()).await {
+                            Ok(Some(Ok(bytes))) => {
+                                let bytes = bytes.freeze();
+                                match RendezvousMessage::parse_from_bytes(&bytes) {
+                                    Ok(RendezvousMessage {
+                                        union: Some(rendezvous_message::Union::KeyExchange(ex)),
+                                        ..
+                                    }) if ex.keys.len() == 2 => {
+                                        let key = Encrypt::decode(&ex.keys[1], &ex.keys[0], &our_sk)?;
+                                        enc = Some(Arc::new(std::sync::Mutex::new(Encrypt::new(key))));
+                                        log::debug!("Tcp connection from {:?} secured", addr);
+                                    }
+                                    // an old client that answered something else: serve it in the clear
+                                    _ => first = Some(bytes),
+                                }
+                            }
+                            _ => return Ok(()),
+                        }
+                    }
+                }
+            }
+            let dec = enc.clone();
+            let rest = b.map(move |r| {
+                r.ok().and_then(|mut bytes| match dec.as_ref() {
+                    // a frame that does not open closes the connection
+                    Some(e) => e.lock().unwrap().dec(&mut bytes).ok().map(|_| bytes.freeze()),
+                    None => Some(bytes.freeze()),
+                })
+            });
+            let incoming = Box::pin(hbb_common::futures::stream::iter(first.map(Some)).chain(rest));
+            self.run_stream(incoming, Some(Sink::TcpStream(a, enc)), addr, key, ws).await;
         }
         Ok(())
     }
@@ -1314,7 +1379,7 @@ impl RendezvousServer {
 
     async fn send_bytes(sink: &mut Option<Sink>, bytes: Bytes) -> bool {
         match sink.as_mut() {
-            Some(Sink::TcpStream(s)) => s.send(bytes).await.is_ok(),
+            Some(Sink::TcpStream(s, enc)) => s.send(seal(enc, bytes)).await.is_ok(),
             Some(Sink::Ws(ws)) => ws
                 .send(tungstenite::Message::Binary(bytes.to_vec()))
                 .await
