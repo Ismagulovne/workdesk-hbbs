@@ -1242,6 +1242,7 @@ impl RendezvousServer {
                 Ok(Some(Ok(bytes))) => first = Some(bytes.freeze()),
                 Ok(_) => return Ok(()), // closed before saying anything
                 Err(_) => {
+                    log::info!("Tcp connection from {:?} is silent, key exchange: {}", addr, self.inner.sk.is_some());
                     if let Some(sk) = self.inner.sk.as_ref() {
                         let (mut our_pk, our_sk) = box_::gen_keypair();
                         // The high bit of the signed key marks servers that also sign key exchange
@@ -1253,6 +1254,7 @@ impl RendezvousServer {
                             ..Default::default()
                         });
                         a.send(Bytes::from(msg_out.write_to_bytes()?)).await?;
+                        log::info!("KeyExchange sent to {:?}", addr);
                         match timeout(KX_REPLY_MS, b.next()).await {
                             Ok(Some(Ok(bytes))) => {
                                 let bytes = bytes.freeze();
@@ -1263,7 +1265,7 @@ impl RendezvousServer {
                                     }) if ex.keys.len() == 2 => {
                                         let key = Encrypt::decode(&ex.keys[1], &ex.keys[0], &our_sk)?;
                                         enc = Some(Arc::new(std::sync::Mutex::new(Encrypt::new(key))));
-                                        log::debug!("Tcp connection from {:?} secured", addr);
+                                        log::info!("Tcp connection from {:?} secured", addr);
                                     }
                                     // an old client that answered something else: serve it in the clear
                                     _ => first = Some(bytes),
